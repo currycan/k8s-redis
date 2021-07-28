@@ -1,0 +1,127 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: redis
+  labels:
+    app: redis
+spec:
+  type: LoadBalancer
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      nodePort: 30379
+  selector:
+    app: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  serviceName: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - image: redis:4.0.11
+          imagePullPolicy: IfNotPresent
+          command:
+            - "redis-server"
+          args:
+            - "/etc/redis/redis.conf"
+            - "--protected-mode"
+            - "no"
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - "-c"
+                  - sleep 0.01
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - "-c"
+                  - |
+                    sleep 1
+          name: redis
+          ports:
+            - containerPort: 6379
+              protocol: TCP
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 500m
+              memory: 500Mi
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 60
+            timeoutSeconds: 1
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 5
+            timeoutSeconds: 1
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          volumeMounts:
+            - name: redis
+              mountPath: /data
+            - name: config
+              mountPath: /etc/redis/
+              readOnly: false
+      volumes:
+        - name: redis
+          persistentVolumeClaim:
+            claimName: redisdata
+        - name: config
+          configMap:
+            name: redis-config
+            defaultMode: 0755
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redisdata
+  namespace: redis
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: nfs-storage-class
+---
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: redis-config
+  namespace: redis
+  labels:
+    app: redis
+data:
+  redis.conf: |-
+    dir /data
+    port 6379
+    bind 0.0.0.0
+    appendonly yes
+    protected-mode no
+    requirepass 123456
+    pidfile /data/redis-6379.pid

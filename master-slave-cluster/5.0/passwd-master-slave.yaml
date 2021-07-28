@@ -1,0 +1,456 @@
+---
+# redis 密码
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-passwd
+data:
+  # auth12345
+  password: YXV0aDEyMzQ1
+type: Opaque
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-cluster
+  labels:
+    app: redis
+  annotations:
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+spec:
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+    - name: gossip
+      port: 16379
+      targetPort: 16379
+  publishNotReadyAddresses: true
+  clusterIP: None
+  selector:
+    app: redis
+    appCluster: redis-cluster
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: redis
+      appCluster: redis-cluster
+  serviceName: redis-cluster
+  template:
+    metadata:
+      labels:
+        app: redis
+        appCluster: redis-cluster
+    spec:
+      terminationGracePeriodSeconds: 20
+      # nodeSelector:
+      #   node: ml
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - redis
+                topologyKey: kubernetes.io/hostname
+      imagePullSecrets:
+        - name: regsecret
+      initContainers:
+        - name: init-redis
+          image: currycan/peer-finer:1.0.0
+          command: ["sh", "-c"]
+          args:
+            - |
+              cat /tmp/redis.conf >> /mnt/redis.conf;
+              cp -a /usr/bin/peer-finder /mnt;
+              chmod 775 /mnt/peer-finder
+          volumeMounts:
+            - name: redis-conf
+              mountPath: /tmp
+            - name: config
+              mountPath: /mnt
+      containers:
+        - name: redis-cluster
+          image: redis:5.0
+          ports:
+            - containerPort: 6379
+              name: redis
+            - containerPort: 16379
+              name: gossip
+          command:
+            - "/bin/sh"
+            - "-c"
+            - |
+              /script/bootstrap-pod.sh
+          resources:
+            limits:
+              cpu: 4
+              memory: 4Gi
+            requests:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            exec:
+              command:
+                - "/bin/sh"
+                - "-c"
+                - "redis-cli -h $(hostname) -a $REDIS_PASSWD ping"
+            initialDelaySeconds: 10
+            timeoutSeconds: 2
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command:
+                - "/bin/sh"
+                - "-c"
+                - "redis-cli -h $(hostname) -a $REDIS_PASSWD ping"
+            initialDelaySeconds: 60
+            timeoutSeconds: 3
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            # 设置Redis密码，密码通过secret存储
+            - name: REDIS_PASSWD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-passwd
+                  key: password
+            # redis 集群节点数
+            - name: CLUSTER_REPLICAS
+              value: "6"
+            - name: ANNOUNCE_IP
+              value: "10.0.0.1"
+            - name: ANNOUNCE_PORT
+              value: "30370"
+            - name: GOSSIP_PORT
+              value: "30470"
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          volumeMounts:
+            - name: script
+              mountPath: /script
+              readOnly: false
+            - name: config
+              mountPath: /usr/bin/peer-finder
+              subPath: peer-finder
+              readOnly: false
+            - name: config
+              mountPath: /etc/redis/redis.conf
+              subPath: redis.conf
+              readOnly: false
+            - name: data
+              mountPath: /data
+              readOnly: false
+      volumes:
+        - name: redis-conf
+          configMap:
+            name: redis-conf
+            items:
+              - key: redis.conf
+                path: redis.conf
+            defaultMode: 0666
+        - name: config
+          emptyDir: {}
+        - name: script
+          configMap:
+            name: redis-conf
+            items:
+              - key: bootstrap-pod.sh
+                path: bootstrap-pod.sh
+              - key: meet-cluster.sh
+                path: meet-cluster.sh
+            defaultMode: 0777
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          name: redis-cluster
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: "nfs-storage-class"
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-conf
+data:
+  redis.conf: |
+    dir /data
+    port 6379
+    bind 0.0.0.0
+    appendonly yes
+    protected-mode no
+    pidfile /data/redis-6379.pid
+    cluster-enabled yes
+    cluster-require-full-coverage no
+    cluster-config-file /data/nodes.conf
+    cluster-migration-barrier 1
+    cluster-node-timeout 15000
+    activerehashing yes
+    appendfsync everysec
+    hash-max-ziplist-entries 512
+    hash-max-ziplist-value 64
+    hll-sparse-max-bytes 3000
+    list-compress-depth 0
+    maxmemory-policy noeviction
+    maxmemory-samples 5
+    no-appendfsync-on-rewrite no
+    set-max-intset-entries 512
+    slowlog-log-slower-than 10000
+    slowlog-max-len 128
+    stop-writes-on-bgsave-error yes
+    tcp-keepalive 0
+    timeout 0
+    zset-max-ziplist-entries 128
+    zset-max-ziplist-value 64
+  bootstrap-pod.sh: |
+    #!/bin/bash
+    HOSTNAME="$(hostname)"
+    INDEX="${HOSTNAME##*-}"
+    mkdir -p /data/conf
+    if [ ! -z $REDIS_PASSWD ];then
+      echo "requirepass $REDIS_PASSWD" >> /etc/redis/redis.conf
+      echo "masterauth $REDIS_PASSWD" >> /etc/redis/redis.conf
+    fi
+    echo "cluster-announce-ip ${ANNOUNCE_IP}" >> /etc/redis/redis.conf
+    case $INDEX in
+      0)
+        echo "cluster-announce-port ${ANNOUNCE_PORT}" >> /etc/redis/redis.conf
+        echo "cluster-announce-bus-port ${GOSSIP_PORT}" >> /etc/redis/redis.conf
+        ;;
+      1)
+        echo "cluster-announce-port $(expr $ANNOUNCE_PORT + 1)" >> /etc/redis/redis.conf
+        echo "cluster-announce-bus-port $(expr $GOSSIP_PORT + 1)" >> /etc/redis/redis.conf
+        ;;
+      2)
+        echo "cluster-announce-port $(expr $ANNOUNCE_PORT + 2)" >> /etc/redis/redis.conf
+        echo "cluster-announce-bus-port $(expr $GOSSIP_PORT + 2)" >> /etc/redis/redis.conf
+        ;;
+      3)
+        echo "cluster-announce-port $(expr $ANNOUNCE_PORT + 3)" >> /etc/redis/redis.conf
+        echo "cluster-announce-bus-port $(expr $GOSSIP_PORT + 3)" >> /etc/redis/redis.conf
+        ;;
+      4)
+        echo "cluster-announce-port $(expr $ANNOUNCE_PORT + 4)" >> /etc/redis/redis.conf
+        echo "cluster-announce-bus-port $(expr $GOSSIP_PORT + 4)" >> /etc/redis/redis.conf
+        ;;
+      5)
+        echo "cluster-announce-port $(expr $ANNOUNCE_PORT + 5)" >> /etc/redis/redis.conf
+        echo "cluster-announce-bus-port $(expr $GOSSIP_PORT + 5)" >> /etc/redis/redis.conf
+        ;;
+      *)
+        echo "error"
+      esac
+    redis-server /etc/redis/redis.conf &
+    peer-finder -on-start '/script/meet-cluster.sh' -service redis-cluster -ns $POD_NAMESPACE
+    sleep 1
+    wait
+  meet-cluster.sh: |
+    #!/bin/bash
+    [[ -z $CLUSTER_REPLICAS ]] && echo 'CLUSTER_REPLICAS env does not exist!!' && exit 1
+    PORT=6379
+    CLUSTER_IPS=""
+    PET_ORDINAL=$(hostname | rev | cut -d- -f1)
+    CLUSTER_REPLICAS_FLAG=$(expr $CLUSTER_REPLICAS - 1)
+    MEET_FLAG=$(grep "connected" /data/nodes.conf | wc -l)
+
+    # a new pod_5 has been created, then create cluster
+    if [[ $PET_ORDINAL == $CLUSTER_REPLICAS_FLAG && $MEET_FLAG != $CLUSTER_REPLICAS ]]; then
+      echo "here is a new redis cluster node"
+      echo "creating cluster..."
+      while read -ra LINE
+      do
+        CLUSTER_IPS="${CLUSTER_IPS} $(getent hosts ${LINE} | cut -d ' ' -f1):${PORT}"
+      done
+      echo "check cluster node ..."
+      for PEER_IP in $(getent hosts ${LINE} | cut -d ' ' -f1)
+      do
+      if [ -z $REDIS_PASSWD ];then
+        until redis-cli -h $PEER_IP ping; do sleep 1; done
+      else
+        until redis-cli -h $PEER_IP -a $REDIS_PASSWD ping; do sleep 1; done
+      fi
+      done
+      echo "create cluster command: redis-cli --cluster create ${CLUSTER_IPS} -a xxxxxxx --cluster-replicas 1"
+      echo yes | redis-cli --cluster create ${CLUSTER_IPS} -a $REDIS_PASSWD --cluster-replicas 1
+    # a used pod has been found,and meet into the cluster
+    elif [ PET_ORDINAL < $CLUSTER_REPLICAS_FLAG ];then
+      echo "not the last replication"
+    elif [[ $MEET_FLAG == $CLUSTER_REPLICAS ]];then
+      echo "here is a used node from other cluster"
+      redis-cli -c cluster meet $POD_IP $PORT
+    fi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-cluster-0
+  labels:
+    app: redis
+  annotations:
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+spec:
+  type: NodePort
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      nodePort: 30370
+    - name: gossip
+      port: 16379
+      targetPort: 16379
+      nodePort: 30470
+  publishNotReadyAddresses: true
+  selector:
+    app: redis
+    appCluster: redis-cluster
+    statefulset.kubernetes.io/pod-name: redis-0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-cluster-1
+  labels:
+    app: redis
+  annotations:
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+spec:
+  type: NodePort
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      nodePort: 30371
+    - name: gossip
+      port: 16379
+      targetPort: 16379
+      nodePort: 30471
+  publishNotReadyAddresses: true
+  selector:
+    app: redis
+    appCluster: redis-cluster
+    statefulset.kubernetes.io/pod-name: redis-1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-cluster-2
+  labels:
+    app: redis
+  annotations:
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+spec:
+  type: NodePort
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      nodePort: 30372
+    - name: gossip
+      port: 16379
+      targetPort: 16379
+      nodePort: 30472
+  publishNotReadyAddresses: true
+  selector:
+    app: redis
+    appCluster: redis-cluster
+    statefulset.kubernetes.io/pod-name: redis-2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-cluster-3
+  labels:
+    app: redis
+  annotations:
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+spec:
+  type: NodePort
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      nodePort: 30373
+    - name: gossip
+      port: 16379
+      targetPort: 16379
+      nodePort: 30473
+  publishNotReadyAddresses: true
+  selector:
+    app: redis
+    appCluster: redis-cluster
+    statefulset.kubernetes.io/pod-name: redis-3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-cluster-4
+  labels:
+    app: redis
+  annotations:
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+spec:
+  type: NodePort
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      nodePort: 30374
+    - name: gossip
+      port: 16379
+      targetPort: 16379
+      nodePort: 30474
+  publishNotReadyAddresses: true
+  selector:
+    app: redis
+    appCluster: redis-cluster
+    statefulset.kubernetes.io/pod-name: redis-4
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-cluster-5
+  labels:
+    app: redis
+  annotations:
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+spec:
+  type: NodePort
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      nodePort: 30375
+    - name: gossip
+      port: 16379
+      targetPort: 16379
+      nodePort: 30475
+  publishNotReadyAddresses: true
+  selector:
+    app: redis
+    appCluster: redis-cluster
+    statefulset.kubernetes.io/pod-name: redis-5
