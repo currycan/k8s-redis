@@ -189,6 +189,8 @@ data:
     appendonly yes
     protected-mode no
     pidfile /data/redis-6379.pid
+    loglevel notice
+    logfile "/data/redis.log"
     cluster-enabled yes
     cluster-require-full-coverage no
     cluster-config-file /data/nodes.conf
@@ -280,6 +282,7 @@ data:
       fi
       done
       echo "create cluster command: redis-cli --cluster create ${CLUSTER_IPS} --cluster-replicas 1"
+      sleep 5
       echo yes | redis-cli --cluster create ${CLUSTER_IPS} --cluster-replicas 1
     # a used pod has been found,and meet into the cluster
     elif [ PET_ORDINAL < $CLUSTER_REPLICAS_FLAG ];then
